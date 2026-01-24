@@ -23,7 +23,25 @@ interface UploadedFile {
 // 1. The Markdown Renderer (Handles the AI response formatting)
 const MarkdownRenderer = ({ content }: { content: string }) => {
   return (
-    <div className="prose prose-sm max-w-none dark:prose-invert prose-p:leading-relaxed prose-pre:bg-gray-100 dark:prose-pre:bg-gray-800 rounded-lg">
+    <div className="
+      prose prose-sm max-w-none
+
+      /* --- LIGHT MODE: Force High Contrast --- */
+      text-gray-900
+      prose-headings:text-gray-900
+      prose-p:text-gray-900
+      prose-strong:text-gray-900
+      prose-li:text-gray-900
+      prose-code:text-blue-700
+
+      /* --- DARK MODE: handled by invert --- */
+      dark:prose-invert
+
+      /* --- EXTRAS --- */
+      prose-p:leading-relaxed
+      prose-pre:bg-gray-100 dark:prose-pre:bg-gray-800
+      rounded-lg
+    ">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
     </div>
   );

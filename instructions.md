@@ -16,3 +16,7 @@ npm install lucide-react react-markdown remark-gfm clsx tailwind-merge
 - **tailwind-merge**: A utility for merging Tailwind CSS classes
 
 Make sure you have Node.js and npm installed before running this command. If you encounter any permission issues, you may need to use `sudo` on Linux/macOS or run the command prompt as Administrator on Windows.
+
+## Backend Dependencies
+pip install openai tiktoken numpy pandas pypdf python-docx openpyxl
+pip install atlassian-python-api schedule

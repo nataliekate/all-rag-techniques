@@ -1,0 +1,62 @@
+from flask import Blueprint, request, jsonify, session
+from flask_bcrypt import Bcrypt
+from user_manager import save_user, find_user_by_username, find_user_by_id
+
+auth_bp = Blueprint('auth', __name__)
+# We create a local Bcrypt instance here since we aren't using an extension file
+bcrypt = Bcrypt()
+
+@auth_bp.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Missing fields"}), 400
+
+    # 1. Check if user exists
+    if find_user_by_username(username):
+        return jsonify({"error": "User already exists"}), 409
+
+    # 2. Hash Password (Safety first, even for PoC!)
+    hashed_pw = bcrypt.generate_password_hash(password).decode('utf-8')
+
+    # 3. Save to JSON
+    save_user(username, hashed_pw)
+
+    return jsonify({"message": "User created"}), 201
+
+@auth_bp.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+
+    # 1. Find user in JSON
+    user = find_user_by_username(username)
+
+    # 2. Verify Password
+    if user and bcrypt.check_password_hash(user['password_hash'], password):
+        # 3. Save to Session
+        session['user_id'] = user['id']
+        return jsonify({"message": "Logged in", "user": {"username": user['username']}})
+
+    return jsonify({"error": "Invalid credentials"}), 401
+
+@auth_bp.route('/logout', methods=['POST'])
+def logout():
+    session.pop('user_id', None)
+    return jsonify({"message": "Logged out"})
+
+@auth_bp.route('/me', methods=['GET'])
+def get_current_user():
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    user = find_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify({"id": user['id'], "username": user['username']})

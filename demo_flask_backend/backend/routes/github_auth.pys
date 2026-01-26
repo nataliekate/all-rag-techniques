@@ -1,0 +1,102 @@
+import requests
+import time
+from flask import Blueprint, request, jsonify, session
+from user_manager import update_user_github_token, find_user_by_id
+
+github_bp = Blueprint('github', __name__)
+
+# ⚠️ REPLACE WITH YOUR ACTUAL CLIENT ID
+# For Device Flow, you don't typically need a Client Secret if configured correctly in GitHub
+GITHUB_CLIENT_ID = "YOUR_GITHUB_CLIENT_ID"
+
+@github_bp.route('/connect', methods=['POST'])
+def start_device_flow():
+    """Step 1: User clicks button -> We ask GitHub for a code."""
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        # Request device code
+        resp = requests.post('https://github.com/login/device/code', headers={
+            'Accept': 'application/json'
+        }, data={
+            'client_id': GITHUB_CLIENT_ID,
+            'scope': 'repo user' # 'repo' needed for private files
+        })
+
+        data = resp.json()
+
+        if 'error' in data:
+            return jsonify({"error": data.get('error_description', 'GitHub Error')}), 400
+
+        # Return the code to the Frontend
+        return jsonify({
+            "device_code": data['device_code'],
+            "user_code": data['user_code'],
+            "verification_uri": data['verification_uri'],
+            "interval": data.get('interval', 5)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@github_bp.route('/poll', methods=['POST'])
+def poll_token():
+    """Step 2: Frontend calls this repeatedly to check if user finished."""
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    device_code = request.json.get('device_code')
+    if not device_code:
+        return jsonify({"error": "Missing device code"}), 400
+
+    # Check GitHub API
+    resp = requests.post('https://github.com/login/oauth/access_token', headers={
+        'Accept': 'application/json'
+    }, data={
+        'client_id': GITHUB_CLIENT_ID,
+        'device_code': device_code,
+        'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
+    })
+
+    data = resp.json()
+
+    # Case A: GitHub says "Wait longer" or "User hasn't authorized yet"
+    if 'error' in data:
+        error_code = data['error']
+        if error_code == 'authorization_pending':
+            return jsonify({"status": "pending"})
+        elif error_code == 'slow_down':
+            # GitHub asks us to increase poll interval
+            return jsonify({"status": "pending", "slow_down": True})
+        elif error_code == 'expired_token':
+            return jsonify({"status": "expired"}), 400
+        else:
+            return jsonify({"error": f"GitHub Error: {error_code}"}), 400
+
+    # Case B: Success! We got the token
+    if 'access_token' in data:
+        token_info = {
+            "access_token": data['access_token'],
+            "scope": data['scope'],
+            "token_type": data['token_type'],
+            "connected_at": time.time()
+        }
+
+        # Save to DB linked to current session user
+        user_id = session['user_id']
+        update_user_github_token(user_id, token_info)
+
+        return jsonify({"status": "success"})
+
+    return jsonify({"error": "Unknown response"}), 500
+
+@github_bp.route('/status', methods=['GET'])
+def check_status():
+    """Used to show 'Connected' state on page load."""
+    if 'user_id' not in session:
+        return jsonify({"connected": False})
+
+    user = find_user_by_id(session['user_id'])
+    # Check if 'github_token' exists and is not empty
+    is_connected = bool(user.get('github_token'))
+    return jsonify({"connected": is_connected})

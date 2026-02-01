@@ -1,0 +1,324 @@
+import os
+import json
+import numpy as np
+import pandas as pd
+import tiktoken
+from openai import OpenAI
+from pypdf import PdfReader
+from docx import Document
+import docx.shared
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+# Retrieve OpenAI API Key from environment variables
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY"))
+
+# Models
+EMBEDDING_MODEL = "text-embedding-3-small" # Efficient, low-cost embedding model
+CHAT_MODEL = "gpt-4o-mini" # Fast, cost-effective chat model
+
+# Chunking Settings
+# We split text into 800-token blocks with 100-token overlap to maintain context across boundaries
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+
+# Storage
+# Vector stores are saved as JSON files in this directory
+STORE_DIR = "vector_stores"
+os.makedirs(STORE_DIR, exist_ok=True)
+
+# ==========================================
+# PART 1: FILE LOADING & TEXT EXTRACTION
+# ==========================================
+
+def extract_text_from_pdf(file_path):
+    """
+    Extracts raw text from a PDF file page by page.
+    """
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        content = page.extract_text()
+        if content:
+            text += content + "\n"
+    return text
+
+def extract_text_from_docx(file_path):
+    """
+    Extracts text from a Word document (.docx), joining paragraphs with newlines.
+    """
+    doc = Document(file_path)
+    return "\n".join([para.text for para in doc.paragraphs if para.text])
+
+def extract_text_from_excel(file_path):
+    """
+    Extracts text from Excel for INGESTION (RAG Knowledge Base).
+    Uses pandas for speed. Flattens rows into string format: "Col1: Val1 | Col2: Val2".
+    """
+    try:
+        # fillna("") prevents errors when encountering empty cells
+        df = pd.read_excel(file_path).fillna("")
+        text_rows = []
+        for _, row in df.iterrows():
+            # Convert row object to a readable string representation
+            row_text = " | ".join([f"{col}: {val}" for col, val in row.items()])
+            text_rows.append(row_text)
+        return "\n".join(text_rows)
+    except: return ""
+
+def load_file_content(file_path):
+    """
+    Dispatcher function: Identifies file extension and calls the appropriate extractor.
+    Returns: string of extracted text or None if failed.
+    """
+    if not os.path.exists(file_path): return None
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == ".pdf": return extract_text_from_pdf(file_path)
+        elif ext == ".docx": return extract_text_from_docx(file_path)
+        elif ext in [".xlsx", ".xls"]: return extract_text_from_excel(file_path)
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+    return None
+
+# ==========================================
+# PART 2: INDEXING & EMBEDDING
+# ==========================================
+
+def chunk_text(text):
+    """
+    Splits a long text string into smaller chunks based on token count.
+    Uses 'tiktoken' to ensure we respect model limits strictly.
+    """
+    if not text: return []
+    encoding = tiktoken.encoding_for_model(EMBEDDING_MODEL)
+    tokens = encoding.encode(text)
+    chunks = []
+
+    # Slide a window across the tokens with overlap
+    step = CHUNK_SIZE - CHUNK_OVERLAP
+    for i in range(0, len(tokens), step):
+        chunks.append(encoding.decode(tokens[i:i+CHUNK_SIZE]))
+    return chunks
+
+def get_embedding(text):
+    """
+    Calls OpenAI API to convert text into a vector (list of float numbers).
+    Removes newlines to improve embedding performance as recommended by OpenAI.
+    """
+    text = text.replace("\n", " ")
+    return client.embeddings.create(input=[text], model=EMBEDDING_MODEL).data[0].embedding
+
+def get_store_path(store_name):
+    """
+    Sanitizes store name and returns path: e.g., 'uploads' -> 'vector_stores/uploads.json'
+    """
+    clean_name = "".join(c for c in store_name if c.isalnum() or c in ('-','_'))
+    return os.path.join(STORE_DIR, f"{clean_name}.json")
+
+def index_files(file_list, store_name="uploads"):
+    """
+    Main Indexing Loop:
+    1. Loads existing JSON store (if any).
+    2. Removes old data for the files being updated (idempotency).
+    3. Extracts text -> Chunks -> Embeds.
+    4. Saves back to JSON.
+    """
+    store_path = get_store_path(store_name)
+    vector_store = []
+
+    # Load existing data to append to it
+    if os.path.exists(store_path):
+        try:
+            with open(store_path, "r") as f: vector_store = json.load(f)
+        except: pass
+
+    for file_path in file_list:
+        filename = os.path.basename(file_path)
+        # Remove any existing chunks for this specific file so we don't have duplicates
+        vector_store = [x for x in vector_store if x["source_file"] != filename]
+
+        raw_text = load_file_content(file_path)
+        if not raw_text: continue
+
+        chunks = chunk_text(raw_text)
+        for i, chunk in enumerate(chunks):
+            # Create the record
+            vector_store.append({
+                "id": f"{filename}_{i}",
+                "source_file": filename,
+                "store_name": store_name,
+                "text": chunk,
+                "embedding": get_embedding(chunk)
+            })
+
+    # Atomic write (conceptually) - dump entire list back to disk
+    with open(store_path, "w") as f: json.dump(vector_store, f)
+
+# ==========================================
+# PART 3: RETRIEVAL & CHAT
+# ==========================================
+
+def retrieve_context(query, store_name="all", top_k=3):
+    """
+    Semantic Search:
+    1. Embeds the user query.
+    2. Loads the target vector store(s).
+    3. Calculates Cosine Similarity (Dot Product) between query and all docs.
+    4. Returns top K matches.
+    """
+    target_stores = []
+
+    # Determine which JSON files to search
+    if store_name == "all":
+        target_stores = [os.path.join(STORE_DIR, f) for f in os.listdir(STORE_DIR) if f.endswith(".json")]
+    else:
+        path = get_store_path(store_name)
+        if os.path.exists(path): target_stores.append(path)
+
+    query_vec = get_embedding(query)
+    results = []
+
+    for path in target_stores:
+        with open(path, "r") as f:
+            for item in json.load(f):
+                # Dot product works for cosine similarity because OpenAI embeddings are normalized
+                score = np.dot(query_vec, item["embedding"])
+                item["score"] = score
+                results.append(item)
+
+    # Sort descending by score (highest similarity first)
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+def chat_with_docs(user_query, store_name="all"):
+    """
+    The RAG Generation Step:
+    1. Retrieve relevant context.
+    2. Stuff context into the System Prompt.
+    3. Ask GPT to answer based ONLY on that context.
+    """
+    relevant = retrieve_context(user_query, store_name)
+    if not relevant: return "I don't have enough info on that."
+
+    # format: "Src: filename.pdf \n Content..."
+    context = "\n".join([f"Src: {c['source_file']}\n{c['text']}" for c in relevant])
+
+    messages = [
+        {"role": "system", "content": "Answer using the context provided."},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {user_query}"}
+    ]
+
+    res = client.chat.completions.create(model=CHAT_MODEL, messages=messages)
+    return res.choices[0].message.content
+
+# ==========================================
+# PART 4: BULK QA (Smart Processing)
+# ==========================================
+
+def process_bulk_file(input_path, output_path, store_name="all"):
+    """
+    Router for Bulk Processing: decides if it's Excel or Word.
+    """
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext in [".xlsx", ".xls"]: return process_bulk_excel(input_path, output_path, store_name)
+    elif ext == ".docx": return process_bulk_docx(input_path, output_path, store_name)
+    else: raise ValueError("Unsupported format")
+
+def process_bulk_excel(input_path, output_path, store_name):
+    """
+    Advanced Excel Processor using 'openpyxl' to preserve structure/hidden states.
+    1. Loads workbook.
+    2. Iterates ALL sheets.
+    3. Detects Question Column (heuristics + visibility check).
+    4. Appends Answers in a new column.
+    """
+    print(f"📊 Processing Excel (Multi-sheet + Hidden Support): {input_path}")
+    wb = openpyxl.load_workbook(input_path)
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+
+        # --- Step 1: Detect Question Column ---
+        q_col_index = None
+        max_col = ws.max_column
+
+        # Strategy A: Check headers in Row 1 for keywords
+        for col in range(1, max_col + 1):
+            col_letter = get_column_letter(col)
+            # CRITICAL: Skip hidden columns
+            if ws.column_dimensions[col_letter].hidden:
+                continue
+
+            cell_val = ws.cell(row=1, column=col).value
+            if cell_val and any(k in str(cell_val).lower() for k in ['question', 'query', 'prompt', 'input']):
+                q_col_index = col
+                break
+
+        # Strategy B: Fallback to the first VISIBLE column
+        if not q_col_index:
+            for col in range(1, max_col + 1):
+                col_letter = get_column_letter(col)
+                if not ws.column_dimensions[col_letter].hidden:
+                    q_col_index = col
+                    break
+
+        if not q_col_index: continue # Skip if sheet seems empty
+
+        # --- Step 2: Prepare Answer Column ---
+        ans_col_index = max_col + 1
+        ws.cell(row=1, column=ans_col_index, value="AI Response")
+
+        print(f"   -> Sheet '{sheet_name}': Using Column {q_col_index}")
+
+        # --- Step 3: Iterate Rows & Answer ---
+        for row in range(2, ws.max_row + 1):
+            # CRITICAL: Skip hidden rows
+            if ws.row_dimensions[row].hidden:
+                continue
+
+            question_cell = ws.cell(row=row, column=q_col_index)
+            question_text = question_cell.value
+
+            if not question_text or str(question_text).strip() == "":
+                continue
+
+            try:
+                # Generate Answer
+                ans = chat_with_docs(str(question_text), store_name=store_name)
+                # Write to Cell
+                ws.cell(row=row, column=ans_col_index, value=ans)
+            except Exception as e:
+                print(f"Error answering row {row}: {e}")
+                ws.cell(row=row, column=ans_col_index, value="Error generating answer")
+
+    wb.save(output_path)
+    return output_path
+
+def process_bulk_docx(input_path, output_path, store_name):
+    """
+    Docx Processor:
+    1. Scans paragraphs.
+    2. Identifies questions via heuristics (Ends with '?' or is a List Item).
+    3. Appends answer in Blue color directly into the document.
+    """
+    doc = Document(input_path)
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text: continue
+
+        # Heuristic: Is it a question?
+        # - Ends with '?'
+        # - Or style starts with 'List' (Bullet points)
+        if text.endswith('?') or para.style.name.startswith('List'):
+            ans = chat_with_docs(text, store_name=store_name)
+
+            # Styling the answer
+            run = para.add_run(f'\n    --> AI: {ans}')
+            run.font.color.rgb = docx.shared.RGBColor(0, 100, 200) # Blue color
+
+    doc.save(output_path)
+    return output_path

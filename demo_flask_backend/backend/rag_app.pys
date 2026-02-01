@@ -208,7 +208,7 @@ def chat_with_docs(user_query, store_name="all"):
     context = "\n".join([f"Src: {c['source_file']}\n{c['text']}" for c in relevant])
 
     messages = [
-        {"role": "system", "content": "Answer using the context provided."},
+        {"role": "system", "content": "You are a helpful and friendly assistant. Answer the user's question in a natural, human-like manner using the provided context. If the answer is not in the context, politely say you don't know."},
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {user_query}"}
     ]
 
@@ -230,35 +230,39 @@ def process_bulk_file(input_path, output_path, store_name="all"):
 
 def process_bulk_excel(input_path, output_path, store_name):
     """
-    Advanced Excel Processor using 'openpyxl' to preserve structure/hidden states.
-    1. Loads workbook.
-    2. Iterates ALL sheets.
-    3. Detects Question Column (heuristics + visibility check).
-    4. Appends Answers in a new column.
+    Advanced Excel Processor:
+    1. Loads workbook & iterates sheets.
+    2. Identifies 'Question' column (skips hidden).
+    3. Identifies 'Answer' column (skips hidden) OR creates one.
+    4. Fills answers.
     """
-    print(f"📊 Processing Excel (Multi-sheet + Hidden Support): {input_path}")
+    print(f"📊 Processing Excel (Smart Columns): {input_path}")
     wb = openpyxl.load_workbook(input_path)
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-
-        # --- Step 1: Detect Question Column ---
-        q_col_index = None
         max_col = ws.max_column
 
-        # Strategy A: Check headers in Row 1 for keywords
+        # --- Step 1: Detect Columns ---
+        q_col_index = None
+        ans_col_index = None
+
+        # Scan headers (Row 1)
         for col in range(1, max_col + 1):
             col_letter = get_column_letter(col)
-            # CRITICAL: Skip hidden columns
-            if ws.column_dimensions[col_letter].hidden:
-                continue
+            if ws.column_dimensions[col_letter].hidden: continue # Skip hidden
 
-            cell_val = ws.cell(row=1, column=col).value
-            if cell_val and any(k in str(cell_val).lower() for k in ['question', 'query', 'prompt', 'input']):
+            cell_val = str(ws.cell(row=1, column=col).value or "").lower()
+
+            # Detect Question Column
+            if not q_col_index and any(k in cell_val for k in ['question', 'query', 'prompt', 'input']):
                 q_col_index = col
-                break
 
-        # Strategy B: Fallback to the first VISIBLE column
+            # Detect Answer Column: Look for user-provided "Answer", "Response", etc.
+            if not ans_col_index and any(k in cell_val for k in ['answer', 'response', 'ai output', 'bot']):
+                ans_col_index = col
+
+        # Fallback for Question: First visible column
         if not q_col_index:
             for col in range(1, max_col + 1):
                 col_letter = get_column_letter(col)
@@ -266,34 +270,32 @@ def process_bulk_excel(input_path, output_path, store_name):
                     q_col_index = col
                     break
 
-        if not q_col_index: continue # Skip if sheet seems empty
+        if not q_col_index: continue # Skip empty sheet
 
-        # --- Step 2: Prepare Answer Column ---
-        ans_col_index = max_col + 1
-        ws.cell(row=1, column=ans_col_index, value="AI Response")
+        # Fallback for Answer: Create new column if not found
+        if not ans_col_index:
+            ans_col_index = max_col + 1
+            ws.cell(row=1, column=ans_col_index, value="AI Response")
+        else:
+            print(f"   -> Using existing Answer column: '{ws.cell(row=1, column=ans_col_index).value}'")
 
-        print(f"   -> Sheet '{sheet_name}': Using Column {q_col_index}")
+        print(f"   -> Sheet '{sheet_name}': Q-Col={q_col_index}, A-Col={ans_col_index}")
 
-        # --- Step 3: Iterate Rows & Answer ---
+        # --- Step 2: Iterate Rows & Answer ---
         for row in range(2, ws.max_row + 1):
-            # CRITICAL: Skip hidden rows
-            if ws.row_dimensions[row].hidden:
-                continue
+            if ws.row_dimensions[row].hidden: continue
 
             question_cell = ws.cell(row=row, column=q_col_index)
             question_text = question_cell.value
 
-            if not question_text or str(question_text).strip() == "":
-                continue
+            if not question_text or str(question_text).strip() == "": continue
 
             try:
-                # Generate Answer
                 ans = chat_with_docs(str(question_text), store_name=store_name)
-                # Write to Cell
                 ws.cell(row=row, column=ans_col_index, value=ans)
             except Exception as e:
                 print(f"Error answering row {row}: {e}")
-                ws.cell(row=row, column=ans_col_index, value="Error generating answer")
+                ws.cell(row=row, column=ans_col_index, value="Error")
 
     wb.save(output_path)
     return output_path
@@ -317,7 +319,7 @@ def process_bulk_docx(input_path, output_path, store_name):
             ans = chat_with_docs(text, store_name=store_name)
 
             # Styling the answer
-            run = para.add_run(f'\n    --> AI: {ans}')
+            run = para.add_run(f'\nAnswer: {ans}')
             run.font.color.rgb = docx.shared.RGBColor(0, 100, 200) # Blue color
 
     doc.save(output_path)
